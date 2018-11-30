@@ -11,12 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/dave/dst/decorator/resolver/guess"
-
-	"github.com/dave/dst/decorator"
-
 	"github.com/dave/dst"
-
+	"github.com/dave/dst/decorator"
+	"github.com/dave/dst/decorator/resolver/guess"
 	"github.com/pkg/errors"
 	"golang.org/x/tools/go/packages"
 )
