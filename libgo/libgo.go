@@ -10,12 +10,16 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/dave/dst"
 	"github.com/dave/dst/decorator"
 	"github.com/dave/dst/decorator/resolver/guess"
+	"github.com/dave/libify"
 	"github.com/pkg/errors"
 	"golang.org/x/tools/go/packages"
+	"gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4/plumbing/object"
 )
 
 // Main converts a Go internal command line app to a library
@@ -25,19 +29,42 @@ func Main(ctx context.Context, options Options) error {
 		options: options,
 	}
 
-	if err := l.loadAndFilter(ctx); err != nil {
-		return errors.WithStack(err)
+	if options.Init {
+
+		if err := l.prepDir(); err != nil {
+			return errors.WithStack(err)
+		}
+
+		if err := l.load(ctx); err != nil {
+			return errors.WithStack(err)
+		}
+
+		if err := l.updateImportsAndDisableTests(); err != nil {
+			return errors.WithStack(err)
+		}
+
+		if err := l.save(); err != nil {
+			return errors.WithStack(err)
+		}
+
+		if err := l.commit(); err != nil {
+			return errors.WithStack(err)
+		}
+
+	} else {
+
+		if err := l.reset(); err != nil {
+			return errors.WithStack(err)
+		}
+
 	}
 
-	if err := l.loadFiltered(ctx); err != nil {
-		return errors.WithStack(err)
-	}
+	// PathFrom is the package path of the command - e.g. cmd/link
+	// PathTo is the path root of the new package paths - e.g. github.com/foo/bar
+	// So the new path to the command will be github.com/foo/bar/cmd/link
+	pathCmd := path.Join(options.PathTo, options.PathFrom)
 
-	if err := l.updateImportsAndDisableTests(); err != nil {
-		return errors.WithStack(err)
-	}
-
-	if err := l.save(); err != nil {
+	if err := libify.Main(ctx, libify.Options{Root: options.PathTo, Path: pathCmd}); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -46,8 +73,56 @@ func Main(ctx context.Context, options Options) error {
 
 type libgoer struct {
 	options Options
-	paths   []string
 	pkgs    []*decorator.Package
+	repo    *git.Repository
+}
+
+func (l *libgoer) reset() error {
+	fmt.Println("reset")
+	defer fmt.Println("reset done")
+
+	dir := filepath.Join(build.Default.GOPATH, "src", l.options.PathTo)
+	r, err := git.PlainOpen(dir)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	l.repo = r
+
+	w, err := l.repo.Worktree()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	h, err := r.Head()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := w.Reset(&git.ResetOptions{Commit: h.Hash(), Mode: git.HardReset}); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (l *libgoer) commit() error {
+	fmt.Println("commit")
+	defer fmt.Println("commit done")
+
+	w, err := l.repo.Worktree()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	if _, err := w.Add("."); err != nil {
+		return errors.WithStack(err)
+	}
+
+	options := &git.CommitOptions{Author: &object.Signature{When: time.Now()}}
+	if _, err := w.Commit("init", options); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
 }
 
 func (l *libgoer) save() error {
@@ -61,7 +136,6 @@ func (l *libgoer) save() error {
 		if strings.HasSuffix(pkg.PkgPath, ".test") {
 			continue
 		}
-		fmt.Println("save", pkg.PkgPath)
 		pkgPathNoTest := strings.TrimSuffix(pkg.PkgPath, "_test")
 		newPathNoTest := l.convertPath(pkgPathNoTest)
 		newPathWithTest := l.convertPath(pkg.PkgPath)
@@ -92,19 +166,20 @@ func (l *libgoer) save() error {
 }
 
 func (l *libgoer) convertPath(p string) string {
-	if !l.includePath(p) {
+	if !filter(p) {
 		return p
 	}
 	return path.Join(l.options.PathTo, p)
 }
 
-func (l *libgoer) includePath(p string) bool {
+func filter(p string) bool {
 	return strings.HasPrefix(p, "cmd/") || strings.HasPrefix(p, "internal/")
 }
 
 func (l *libgoer) updateImportsAndDisableTests() error {
-	fmt.Println("updateImports")
-	defer fmt.Println("updateImports done")
+	fmt.Println("updateImportsAndDisableTests")
+	defer fmt.Println("updateImportsAndDisableTests done")
+
 	for _, pkg := range l.pkgs {
 		for _, file := range pkg.Syntax {
 			dst.Inspect(file, func(n dst.Node) bool {
@@ -146,9 +221,20 @@ func (l *libgoer) updateImportsAndDisableTests() error {
 	return nil
 }
 
-func (l *libgoer) loadFiltered(ctx context.Context) error {
-	fmt.Println("loadFiltered")
-	defer fmt.Println("loadFiltered done")
+func (l *libgoer) load(ctx context.Context) error {
+	fmt.Println("load")
+	defer fmt.Println("load done")
+
+	dir := filepath.Join(build.Default.GOROOT, "src", l.options.PathFrom)
+	pth := l.options.PathFrom
+
+	start := time.Now()
+	paths, err := libify.LoadAllPackages(ctx, pth, dir, filter)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	end := time.Now()
+	fmt.Printf("Loaded %d paths in %v seconds\n", len(paths), end.Sub(start).Seconds())
 
 	cfg := &packages.Config{
 		Mode:    packages.LoadSyntax,
@@ -157,67 +243,83 @@ func (l *libgoer) loadFiltered(ctx context.Context) error {
 		Dir:     filepath.Join(build.Default.GOROOT, "src", l.options.PathFrom),
 	}
 
-	pkgs, err := decorator.Load(cfg, l.paths...)
+	start = time.Now()
+	pkgs, err := decorator.Load(cfg, paths...)
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	end = time.Now()
+	fmt.Printf("Loaded %d packages in %v seconds\n", len(paths), end.Sub(start).Seconds())
+
+	m := map[string]*decorator.Package{}
 
 	for _, pkg := range pkgs {
-		l.pkgs = append(l.pkgs, pkg)
+
+		// here we have:
+		//
+		// | PkgPath | ID              |
+		// | X       | X               | just non-test files
+		// | X       | X [X.test]      | all files in X package (including tests)
+		// | X_test  | X_test [X.test] | just test files in X_test package (this is missing if no X_test tests)
+		// | X.test  | X.test          | generated files
+		//
+		isTestPath := strings.HasSuffix(pkg.PkgPath, "_test")
+		isTestID := strings.HasSuffix(pkg.ID, ".test]")
+		isTestGen := strings.HasSuffix(pkg.ID, ".test")
+
+		if isTestGen {
+			continue
+		}
+
+		if isTestPath {
+			l.pkgs = append(l.pkgs, pkg)
+			continue
+		}
+
+		if isTestID {
+			m[pkg.PkgPath] = pkg
+		} else {
+			// for non test id (e.g. id == "fmt"), only store if the variation with test files
+			// enabled (e.g. id == "fmt [fmt.test]") has not been stored yet.
+			if _, ok := m[pkg.PkgPath]; !ok {
+				m[pkg.PkgPath] = pkg
+			}
+		}
 	}
+
+	for _, p := range m {
+		l.pkgs = append(l.pkgs, p)
+	}
+
 	return nil
 }
 
-func (l *libgoer) loadAndFilter(ctx context.Context) error {
-	fmt.Println("loadAndFilter")
-	defer fmt.Println("loadAndFilter done")
+func (l *libgoer) prepDir() error {
+	fmt.Println("prepDir")
+	defer fmt.Println("prepDir done")
 
-	cfg := &packages.Config{
-		Mode:    packages.LoadImports,
-		Tests:   true,
-		Context: ctx,
-		Dir:     filepath.Join(build.Default.GOROOT, "src", l.options.PathFrom),
+	dir := filepath.Join(build.Default.GOPATH, "src", l.options.PathTo)
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		// don't delete the dir, or the terminal will grumble
+		fis, err := ioutil.ReadDir(dir)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		for _, fi := range fis {
+			fpath := filepath.Join(dir, fi.Name())
+			if err := os.RemoveAll(fpath); err != nil {
+				return errors.WithStack(err)
+			}
+		}
 	}
-
-	pkgs, err := packages.Load(cfg, l.options.PathFrom)
+	if err := os.MkdirAll(dir, 0777); err != nil {
+		return errors.WithStack(err)
+	}
+	r, err := git.PlainInit(dir, false)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-
-	done := map[string]bool{}
-
-	var process func(*packages.Package)
-	process = func(p *packages.Package) {
-		if !l.includePath(p.PkgPath) {
-			return
-		}
-		if done[p.ID] {
-			return
-		}
-		done[p.ID] = true
-		for _, imp := range p.Imports {
-			process(imp)
-		}
-		if !strings.HasSuffix(p.PkgPath, ".test") {
-			l.paths = append(l.paths, p.PkgPath)
-		}
-	}
-
-	for _, pkg := range pkgs {
-		process(pkg)
-	}
-
-	// packages.Load with Test:true only returns test packages in the specified package (not
-	// imports), so a second run is needed to picks up all _test packages.
-	pkgs, err = packages.Load(cfg, l.paths...)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	for _, pkg := range pkgs {
-		process(pkg)
-	}
-
+	l.repo = r
 	return nil
 }
 
@@ -225,4 +327,5 @@ type Options struct {
 	PathFrom     string
 	PathTo       string
 	DisableTests map[string]map[string]bool
+	Init         bool
 }
