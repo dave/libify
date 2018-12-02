@@ -3,8 +3,16 @@ package libify
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/token"
+	"go/types"
+	"io"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/dave/dst"
+	"github.com/dave/dst/dstutil"
 
 	"github.com/dave/dst/decorator"
 	"github.com/pkg/errors"
@@ -13,11 +21,20 @@ import (
 
 func Main(ctx context.Context, options Options) error {
 
+	if options.Out == nil {
+		options.Out = os.Stdout
+	}
+
 	l := &libifier{options: options}
 
 	if err := l.load(ctx); err != nil {
 		return errors.WithStack(err)
 	}
+
+	if err := l.findPackageLevelVars(); err != nil {
+		return errors.WithStack(err)
+	}
+
 	return nil
 }
 
@@ -25,14 +42,65 @@ func Main(ctx context.Context, options Options) error {
 type libifier struct {
 	options  Options
 	paths    []string
-	packages map[string]*decorator.Package
-	tests    map[string]*decorator.Package
+	packages map[string]*libifyPkg
 }
 
-// Foo is temporary
+func newLibifyPkg(path string) *libifyPkg {
+	return &libifyPkg{
+		path:             path,
+		packageLevelVars: map[types.Object]bool{},
+	}
+}
+
+type libifyPkg struct {
+	path             string
+	pkg              *decorator.Package
+	tst              *decorator.Package
+	packageLevelVars map[types.Object]bool
+}
+
+func (l *libifier) findPackageLevelVars() error {
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			if strings.HasSuffix(lp.pkg.Decorator.Filenames[file], "_test.go") {
+				continue
+			}
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.GenDecl:
+					if n.Tok != token.VAR {
+						return true
+					}
+					if _, ok := c.Parent().(*dst.DeclStmt); ok {
+						// skip vars inside functions
+						return true
+					}
+
+					for _, spec := range n.Specs {
+						spec := spec.(*dst.ValueSpec)
+						// look up the object in the types.Defs
+						for _, id := range spec.Names {
+							if id.Name == "_" {
+								continue
+							}
+							def, ok := lp.pkg.TypesInfo.Defs[lp.pkg.Decorator.Ast.Nodes[id].(*ast.Ident)]
+							if !ok {
+								panic(fmt.Sprintf("can't find %s in defs", id.Name))
+							}
+							lp.packageLevelVars[def] = true
+						}
+					}
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
 func (l *libifier) load(ctx context.Context) error {
-	fmt.Println("load")
-	defer fmt.Println("load done")
+	fmt.Fprintln(l.options.Out, "load")
+	defer fmt.Fprintln(l.options.Out, "load done")
 
 	filter := func(p string) bool { return strings.HasPrefix(p, l.options.RootPath) }
 
@@ -43,7 +111,7 @@ func (l *libifier) load(ctx context.Context) error {
 		return errors.WithStack(err)
 	}
 	end := time.Now()
-	fmt.Printf("Loaded %d paths in %v seconds\n", len(l.paths), end.Sub(start).Seconds())
+	fmt.Fprintf(l.options.Out, "Loaded %d paths in %v seconds\n", len(l.paths), end.Sub(start).Seconds())
 
 	config := &packages.Config{
 		Mode:    packages.LoadSyntax,
@@ -52,8 +120,7 @@ func (l *libifier) load(ctx context.Context) error {
 		Dir:     l.options.RootDir,
 	}
 
-	l.packages = map[string]*decorator.Package{}
-	l.tests = map[string]*decorator.Package{}
+	l.packages = map[string]*libifyPkg{}
 
 	start = time.Now()
 	pkgs, err := decorator.Load(config, l.paths...)
@@ -61,7 +128,7 @@ func (l *libifier) load(ctx context.Context) error {
 		return errors.WithStack(err)
 	}
 	end = time.Now()
-	fmt.Printf("Loaded %d packages in %v seconds\n", len(l.paths), end.Sub(start).Seconds())
+	fmt.Fprintf(l.options.Out, "Loaded %d packages in %v seconds\n", len(l.paths), end.Sub(start).Seconds())
 
 	for _, pkg := range pkgs {
 
@@ -81,18 +148,24 @@ func (l *libifier) load(ctx context.Context) error {
 			continue
 		}
 
+		pth := strings.TrimSuffix(pkg.PkgPath, "_test")
+		if l.packages[pth] == nil {
+			l.packages[pth] = newLibifyPkg(pth)
+		}
+		p := l.packages[pth]
+
 		if isTestPath {
-			l.tests[strings.TrimSuffix(pkg.PkgPath, "_test")] = pkg
+			p.tst = pkg
 			continue
 		}
 
 		if isTestID {
-			l.packages[pkg.PkgPath] = pkg
+			p.pkg = pkg
 		} else {
 			// for non test id (e.g. id == "fmt"), only store if the variation with test files
 			// enabled (e.g. id == "fmt [fmt.test]") has not been stored yet.
-			if _, ok := l.packages[pkg.PkgPath]; !ok {
-				l.packages[pkg.PkgPath] = pkg
+			if p.pkg == nil {
+				p.pkg = pkg
 			}
 		}
 	}
@@ -104,4 +177,5 @@ type Options struct {
 	Path     string
 	RootPath string
 	RootDir  string
+	Out      io.Writer
 }
