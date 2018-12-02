@@ -27,6 +27,7 @@ func TestMain_load(t *testing.T) {
 			Path:     "root/main",
 			RootPath: "root",
 			RootDir:  dir,
+			Out:      ioutil.Discard,
 		},
 	}
 	if err := l.load(context.Background()); err != nil {
@@ -63,7 +64,7 @@ func TestMain_findPackageLevelVars(t *testing.T) {
 	var out []string
 	for _, path := range l.paths {
 		var vars []string
-		for ob := range l.packages[path].packageLevelVars {
+		for ob := range l.packages[path].packageLevelVarObject {
 			vars = append(vars, ob.Name())
 		}
 		sort.Strings(vars)

@@ -36,7 +36,10 @@ func linkOptions() libgo.Options {
 		RootPath: "github.com/dave/link",
 		RootDir:  filepath.Join(build.Default.GOPATH, "src", "github.com/dave/link"),
 		DisableTests: map[string]map[string]bool{
-			"cmd/link": {"TestDWARFiOS": true},
+			"cmd/link": {
+				"TestDWARF":    true,
+				"TestDWARFiOS": true,
+			},
 		},
 		Init: false,
 	}
