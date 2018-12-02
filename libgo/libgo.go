@@ -62,9 +62,9 @@ func Main(ctx context.Context, options Options) error {
 	// PathFrom is the package path of the command - e.g. cmd/link
 	// PathTo is the path root of the new package paths - e.g. github.com/foo/bar
 	// So the new path to the command will be github.com/foo/bar/cmd/link
-	pathCmd := path.Join(options.PathTo, options.PathFrom)
+	pathCmd := path.Join(options.RootPath, options.From)
 
-	if err := libify.Main(ctx, libify.Options{Root: options.PathTo, Path: pathCmd}); err != nil {
+	if err := libify.Main(ctx, libify.Options{RootPath: options.RootPath, Path: pathCmd}); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -81,8 +81,7 @@ func (l *libgoer) reset() error {
 	fmt.Println("reset")
 	defer fmt.Println("reset done")
 
-	dir := filepath.Join(build.Default.GOPATH, "src", l.options.PathTo)
-	r, err := git.PlainOpen(dir)
+	r, err := git.PlainOpen(l.options.RootDir)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -137,10 +136,12 @@ func (l *libgoer) save() error {
 			continue
 		}
 		pkgPathNoTest := strings.TrimSuffix(pkg.PkgPath, "_test")
-		newPathNoTest := l.convertPath(pkgPathNoTest)
-		newPathWithTest := l.convertPath(pkg.PkgPath)
+
+		newPathWithTest := path.Join(l.options.RootPath, pkg.PkgPath)
+
 		oldDir := filepath.Join(build.Default.GOROOT, "src", pkgPathNoTest)
-		newDir := filepath.Join(build.Default.GOPATH, "src", newPathNoTest)
+		newDir := filepath.Join(l.options.RootDir, pkgPathNoTest)
+
 		if fi, err := os.Stat(filepath.Join(oldDir, "testdata")); err == nil && fi.IsDir() {
 			if err := Copy(filepath.Join(oldDir, "testdata"), filepath.Join(newDir, "testdata")); err != nil {
 				return errors.WithStack(err)
@@ -169,7 +170,7 @@ func (l *libgoer) convertPath(p string) string {
 	if !filter(p) {
 		return p
 	}
-	return path.Join(l.options.PathTo, p)
+	return path.Join(l.options.RootPath, p)
 }
 
 func filter(p string) bool {
@@ -225,8 +226,8 @@ func (l *libgoer) load(ctx context.Context) error {
 	fmt.Println("load")
 	defer fmt.Println("load done")
 
-	dir := filepath.Join(build.Default.GOROOT, "src", l.options.PathFrom)
-	pth := l.options.PathFrom
+	dir := filepath.Join(build.Default.GOROOT, "src", l.options.From)
+	pth := l.options.From
 
 	start := time.Now()
 	paths, err := libify.LoadAllPackages(ctx, pth, dir, filter)
@@ -240,7 +241,7 @@ func (l *libgoer) load(ctx context.Context) error {
 		Mode:    packages.LoadSyntax,
 		Tests:   true,
 		Context: ctx,
-		Dir:     filepath.Join(build.Default.GOROOT, "src", l.options.PathFrom),
+		Dir:     dir,
 	}
 
 	start = time.Now()
@@ -298,24 +299,23 @@ func (l *libgoer) prepDir() error {
 	fmt.Println("prepDir")
 	defer fmt.Println("prepDir done")
 
-	dir := filepath.Join(build.Default.GOPATH, "src", l.options.PathTo)
-	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+	if fi, err := os.Stat(l.options.RootDir); err == nil && fi.IsDir() {
 		// don't delete the dir, or the terminal will grumble
-		fis, err := ioutil.ReadDir(dir)
+		fis, err := ioutil.ReadDir(l.options.RootDir)
 		if err != nil {
 			return errors.WithStack(err)
 		}
 		for _, fi := range fis {
-			fpath := filepath.Join(dir, fi.Name())
+			fpath := filepath.Join(l.options.RootDir, fi.Name())
 			if err := os.RemoveAll(fpath); err != nil {
 				return errors.WithStack(err)
 			}
 		}
 	}
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(l.options.RootDir, 0777); err != nil {
 		return errors.WithStack(err)
 	}
-	r, err := git.PlainInit(dir, false)
+	r, err := git.PlainInit(l.options.RootDir, false)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -324,8 +324,9 @@ func (l *libgoer) prepDir() error {
 }
 
 type Options struct {
-	PathFrom     string
-	PathTo       string
+	From         string // package path of command we need to extract - e.g. "cmd/compile"
+	RootPath     string // package path of module root
+	RootDir      string // dir of module root
 	DisableTests map[string]map[string]bool
 	Init         bool
 }

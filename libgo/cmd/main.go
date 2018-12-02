@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"go/build"
 	"os"
+	"path/filepath"
 
 	"github.com/dave/libify/libgo"
 )
-
-const INIT = false
 
 func main() {
 	if err := libgo.Main(context.Background(), linkOptions()); err != nil {
@@ -19,23 +19,25 @@ func main() {
 
 func compileOptions() libgo.Options {
 	return libgo.Options{
-		PathFrom: "cmd/compile",
-		PathTo:   "github.com/dave/compile",
+		From:     "cmd/compile",
+		RootPath: "github.com/dave/compile",
+		RootDir:  filepath.Join(build.Default.GOPATH, "src", "github.com/dave/compile"),
 		DisableTests: map[string]map[string]bool{
 			"cmd/compile_test":             {"TestFormats": true},
 			"cmd/compile/internal/gc_test": {"TestBuiltin": true},
 		},
-		Init: INIT,
+		Init: false,
 	}
 }
 
 func linkOptions() libgo.Options {
 	return libgo.Options{
-		PathFrom: "cmd/link",
-		PathTo:   "github.com/dave/link",
+		From:     "cmd/link",
+		RootPath: "github.com/dave/link",
+		RootDir:  filepath.Join(build.Default.GOPATH, "src", "github.com/dave/link"),
 		DisableTests: map[string]map[string]bool{
 			"cmd/link": {"TestDWARFiOS": true},
 		},
-		Init: INIT,
+		Init: false,
 	}
 }

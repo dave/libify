@@ -3,8 +3,6 @@ package libify
 import (
 	"context"
 	"fmt"
-	"go/build"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,34 +34,34 @@ func (l *libifier) load(ctx context.Context) error {
 	fmt.Println("load")
 	defer fmt.Println("load done")
 
-	filter := func(p string) bool { return strings.HasPrefix(p, l.options.Root) }
-	dir := filepath.Join(build.Default.GOPATH, "src", l.options.Path)
+	filter := func(p string) bool { return strings.HasPrefix(p, l.options.RootPath) }
 
 	start := time.Now()
-	paths, err := LoadAllPackages(ctx, l.options.Path, dir, filter)
+	var err error
+	l.paths, err = LoadAllPackages(ctx, l.options.Path, l.options.RootDir, filter)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 	end := time.Now()
-	fmt.Printf("Loaded %d paths in %v seconds\n", len(paths), end.Sub(start).Seconds())
+	fmt.Printf("Loaded %d paths in %v seconds\n", len(l.paths), end.Sub(start).Seconds())
 
 	config := &packages.Config{
 		Mode:    packages.LoadSyntax,
 		Tests:   true,
 		Context: ctx,
-		Dir:     dir,
+		Dir:     l.options.RootDir,
 	}
 
 	l.packages = map[string]*decorator.Package{}
 	l.tests = map[string]*decorator.Package{}
 
 	start = time.Now()
-	pkgs, err := decorator.Load(config, paths...)
+	pkgs, err := decorator.Load(config, l.paths...)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 	end = time.Now()
-	fmt.Printf("Loaded %d packages in %v seconds\n", len(paths), end.Sub(start).Seconds())
+	fmt.Printf("Loaded %d packages in %v seconds\n", len(l.paths), end.Sub(start).Seconds())
 
 	for _, pkg := range pkgs {
 
@@ -103,5 +101,7 @@ func (l *libifier) load(ctx context.Context) error {
 }
 
 type Options struct {
-	Root, Path string
+	Path     string
+	RootPath string
+	RootDir  string
 }
