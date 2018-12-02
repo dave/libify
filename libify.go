@@ -37,14 +37,38 @@ func Main(ctx context.Context, options Options) error {
 		return errors.WithStack(err)
 	}
 
+	if err := l.findUses(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := l.findFuncs(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := l.findFuncUses(); err != nil {
+		return errors.WithStack(err)
+	}
+
 	// ===== NO READING AFTER HERE ======
 	// ===== NO WRITING BEFORE HERE =====
+
+	if err := l.updateFuncs(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := l.updateFuncUses(); err != nil {
+		return errors.WithStack(err)
+	}
 
 	if err := l.deleteVars(); err != nil {
 		return errors.WithStack(err)
 	}
 
 	if err := l.addStateFiles(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := l.updateUses(); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -70,6 +94,10 @@ func newLibifyPkg(path string) *libifyPkg {
 		packageLevelVarGenDecl:       map[*dst.GenDecl]bool{},
 		packageLevelVarValueSpec:     map[*dst.ValueSpec]bool{},
 		packageStateImportFieldNames: map[string]string{},
+		funcFuncDecl:                 map[*dst.FuncDecl]bool{},
+		funcObject:                   map[types.Object]bool{},
+		varUses:                      map[*dst.Ident]bool{},
+		funcUses:                     map[*dst.Ident]bool{},
 	}
 }
 
@@ -80,8 +108,12 @@ type libifyPkg struct {
 	tst                          *decorator.Package
 	packageLevelVarGenDecl       map[*dst.GenDecl]bool
 	packageLevelVarObject        map[types.Object]bool
+	funcFuncDecl                 map[*dst.FuncDecl]bool
+	funcObject                   map[types.Object]bool
 	packageLevelVarValueSpec     map[*dst.ValueSpec]bool
-	packageStateImportFieldNames map[string]string
+	packageStateImportFieldNames map[string]string // path -> field name
+	varUses                      map[*dst.Ident]bool
+	funcUses                     map[*dst.Ident]bool
 }
 
 func (l *libifier) addStateFiles() error {
@@ -89,9 +121,7 @@ func (l *libifier) addStateFiles() error {
 	defer fmt.Fprintln(l.options.Out, "addStateFiles done")
 	for _, lp := range l.packages {
 		u := uniqueNamePicker{}
-		if len(lp.packageLevelVarGenDecl) == 0 {
-			continue
-		}
+
 		f := &dst.File{
 			Name: dst.NewIdent(lp.pkg.Name),
 		}
@@ -140,21 +170,168 @@ func (l *libifier) addStateFiles() error {
 			},
 		})
 
+		params, err := l.generateNewPackageStateFuncParams(lp)
+		if err != nil {
+			return err
+		}
+
+		body, err := l.generateNewPackageStateFuncBody(lp)
+		if err != nil {
+			return err
+		}
+
+		f.Decls = append(f.Decls, &dst.FuncDecl{
+			Name: dst.NewIdent("NewPackageState"),
+			Type: &dst.FuncType{
+				Params: &dst.FieldList{
+					List: params,
+				},
+				Results: &dst.FieldList{
+					List: []*dst.Field{
+						{
+							Type: &dst.StarExpr{
+								X: dst.NewIdent("PackageState"),
+							},
+						},
+					},
+				},
+			},
+			Body: &dst.BlockStmt{
+				List: body,
+			},
+		})
+
 		lp.pkg.Syntax = append(lp.pkg.Syntax, f)
 		lp.pkg.Decorator.Filenames[f] = filepath.Join(lp.pkg.Dir, "package-state.go")
 	}
 	return nil
 }
 
+func (l *libifier) sortAndFilterImports(lp *libifyPkg) []*libifyPkg {
+	var imports []*libifyPkg
+	for _, imp := range lp.pkg.Imports {
+		implp, ok := l.packages[imp.PkgPath]
+		if !ok {
+			continue
+		}
+		imports = append(imports, implp)
+	}
+
+	sort.Slice(imports, func(i, j int) bool {
+		return imports[i].pathNoVendor < imports[j].pathNoVendor
+	})
+
+	return imports
+}
+
+func (l *libifier) generateNewPackageStateFuncParams(lp *libifyPkg) ([]*dst.Field, error) {
+	var params []*dst.Field
+
+	imports := l.sortAndFilterImports(lp)
+
+	for _, imp := range imports {
+		name := lp.packageStateImportFieldNames[imp.pathNoVendor]
+		f := &dst.Field{
+			Names: []*dst.Ident{dst.NewIdent(fmt.Sprintf("%sPackageState", name))},
+			Type: &dst.StarExpr{
+				X: &dst.Ident{Name: "PackageState", Path: imp.pathNoVendor},
+			},
+		}
+		params = append(params, f)
+	}
+	return params, nil
+}
+
+func (l *libifier) generateNewPackageStateFuncBody(lp *libifyPkg) ([]dst.Stmt, error) {
+	var body []dst.Stmt
+
+	// Create the package state
+	// pstate := &PackageState{}
+	body = append(body, &dst.AssignStmt{
+		Lhs: []dst.Expr{dst.NewIdent("pstate")},
+		Tok: token.DEFINE,
+		Rhs: []dst.Expr{
+			&dst.UnaryExpr{
+				Op: token.AND,
+				X: &dst.CompositeLit{
+					Type: dst.NewIdent("PackageState"),
+				},
+			},
+		},
+	})
+
+	imports := l.sortAndFilterImports(lp)
+
+	// Assign the injected package state for all imported packages
+	// pstate.foo = fooPackageState
+	for _, imp := range imports {
+		name := lp.packageStateImportFieldNames[imp.pathNoVendor]
+		body = append(body, &dst.AssignStmt{
+			Lhs: []dst.Expr{
+				&dst.SelectorExpr{
+					X:   dst.NewIdent("pstate"),
+					Sel: dst.NewIdent(name),
+				},
+			},
+			Tok: token.ASSIGN,
+			Rhs: []dst.Expr{
+				dst.NewIdent(fmt.Sprintf("%sPackageState", name)),
+			},
+		})
+	}
+
+	// Initialise the vars in init order
+	for _, i := range lp.pkg.TypesInfo.InitOrder {
+		for _, v := range i.Lhs {
+			if v.Name() == "_" {
+				continue
+			}
+			if !lp.packageLevelVarObject[v] {
+				continue
+			}
+			body = append(body, &dst.AssignStmt{
+				Lhs: []dst.Expr{
+					&dst.SelectorExpr{
+						X:   dst.NewIdent("pstate"),
+						Sel: dst.NewIdent(v.Name()),
+					},
+				},
+				Tok: token.ASSIGN,
+				//Rhs: []dst.Expr{dst.Clone(lp.pkg.Decorator.Dst.Nodes[i.Rhs]).(dst.Expr)},
+				Rhs: []dst.Expr{lp.pkg.Decorator.Dst.Nodes[i.Rhs].(dst.Expr)},
+			})
+		}
+	}
+
+	// Finally return the package state
+	body = append(body, &dst.ReturnStmt{
+		Results: []dst.Expr{
+			dst.NewIdent("pstate"),
+		},
+	})
+
+	return body, nil
+}
+
 func (l *libifier) generatePackageStateVarFields(lp *libifyPkg, u uniqueNamePicker) ([]*dst.Field, error) {
+
+	// TODO: Should really create unique names with uniqueNamePicker here...
+
 	var fields []*dst.Field
+	var specs []*dst.ValueSpec
 	for vs := range lp.packageLevelVarValueSpec {
+		specs = append(specs, vs)
+	}
+	sort.Slice(specs, func(i, j int) bool {
+		return specs[i].Names[0].Name < specs[j].Names[0].Name
+	})
+	for _, vs := range specs {
 		if vs.Type != nil {
 			// if a type is specified, we can add the names as one field
 			infoType := lp.pkg.TypesInfo.Types[lp.pkg.Decorator.Ast.Nodes[vs.Type].(ast.Expr)]
 			var names []*dst.Ident
 			for _, v := range vs.Names {
-				names = append(names, dst.Clone(v).(*dst.Ident))
+				names = append(names, v)
 			}
 			f := &dst.Field{
 				Names: names,
@@ -171,7 +348,7 @@ func (l *libifier) generatePackageStateVarFields(lp *libifyPkg, u uniqueNamePick
 			value := vs.Values[i]
 			infoType := lp.pkg.TypesInfo.Types[lp.pkg.Decorator.Ast.Nodes[value].(ast.Expr)]
 			f := &dst.Field{
-				Names: []*dst.Ident{dst.Clone(name).(*dst.Ident)},
+				Names: []*dst.Ident{name},
 				Type:  l.typeToAstTypeSpec(infoType.Type, lp.path),
 			}
 			fields = append(fields, f)
@@ -182,39 +359,96 @@ func (l *libifier) generatePackageStateVarFields(lp *libifyPkg, u uniqueNamePick
 
 func (l *libifier) generatePackageStateImportFields(lp *libifyPkg, u uniqueNamePicker) ([]*dst.Field, error) {
 	var fields []*dst.Field
-	var imports []string
-	for _, imp := range lp.pkg.Imports {
-		implp, ok := l.packages[imp.PkgPath]
-		if !ok {
-			continue
-		}
-		if len(implp.packageLevelVarGenDecl) == 0 {
-			continue
-		}
-		imports = append(imports, stripVendor(imp.PkgPath))
-	}
 
-	sort.Strings(imports)
+	imports := l.sortAndFilterImports(lp)
 
-	for _, impPath := range imports {
+	for _, imp := range imports {
 
-		imp := lp.pkg.Imports[impPath]
-
-		name := u.pick(imp.Name)
-		lp.packageStateImportFieldNames[imp.PkgPath] = name
+		name := u.pick(imp.pkg.Name)
+		lp.packageStateImportFieldNames[imp.pathNoVendor] = name
 
 		f := &dst.Field{
 			Names: []*dst.Ident{dst.NewIdent(name)},
 			Type: &dst.StarExpr{
 				X: &dst.Ident{
 					Name: "PackageState",
-					Path: stripVendor(imp.PkgPath),
+					Path: imp.pathNoVendor,
 				},
 			},
 		}
 		fields = append(fields, f)
 	}
 	return fields, nil
+}
+
+func (l *libifier) updateFuncUses() error {
+	fmt.Fprintln(l.options.Out, "updateFuncs")
+	defer fmt.Fprintln(l.options.Out, "updateFuncs done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.CallExpr:
+					var id *dst.Ident
+					switch fun := n.Fun.(type) {
+					case *dst.Ident:
+						id = fun
+					//case *dst.SelectorExpr:
+					//	id = fun.Sel
+					default:
+						return true
+					}
+					if id.Path == "" {
+						if !lp.funcUses[id] {
+							return true
+						}
+						param := dst.NewIdent("pstate")
+						n.Args = append([]dst.Expr{param}, n.Args...)
+					} else {
+						lpid, ok := l.packages[id.Path]
+						if !ok {
+							return true
+						}
+						if !lpid.funcUses[id] {
+							return true
+						}
+						param := &dst.SelectorExpr{
+							X:   dst.NewIdent("pstate"),
+							Sel: dst.NewIdent(lp.packageStateImportFieldNames[id.Path]),
+						}
+						n.Args = append([]dst.Expr{param}, n.Args...)
+					}
+
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) updateFuncs() error {
+	fmt.Fprintln(l.options.Out, "updateFuncs")
+	defer fmt.Fprintln(l.options.Out, "updateFuncs done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.FuncDecl:
+					if !lp.funcFuncDecl[n] {
+						return true
+					}
+					f := &dst.Field{
+						Names: []*dst.Ident{dst.NewIdent("pstate")},
+						Type:  &dst.StarExpr{X: dst.NewIdent("PackageState")},
+					}
+					n.Type.Params.List = append([]*dst.Field{f}, n.Type.Params.List...)
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
 }
 
 func (l *libifier) deleteVars() error {
@@ -242,6 +476,151 @@ func (l *libifier) save() error {
 	for _, lp := range l.packages {
 		if err := lp.pkg.SaveWithResolver(guess.New()); err != nil {
 			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) updateUses() error {
+	fmt.Fprintln(l.options.Out, "updateUses")
+	defer fmt.Fprintln(l.options.Out, "updateUses done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.Ident:
+					if !lp.varUses[n] {
+						return true
+					}
+					if n.Path == "" {
+						c.Replace(&dst.SelectorExpr{
+							X:   dst.NewIdent("pstate"),
+							Sel: n,
+						})
+					} else {
+						c.Replace(&dst.SelectorExpr{
+							X: &dst.SelectorExpr{
+								X:   dst.NewIdent("pstate"),
+								Sel: dst.NewIdent(lp.packageStateImportFieldNames[n.Path]),
+							},
+							Sel: n,
+						})
+						n.Path = ""
+					}
+
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) findUses() error {
+	fmt.Fprintln(l.options.Out, "findUses")
+	defer fmt.Fprintln(l.options.Out, "findUses done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dst.Inspect(file, func(n dst.Node) bool {
+				switch n := n.(type) {
+				case *dst.Ident:
+					var ident *ast.Ident
+					switch node := lp.pkg.Decorator.Ast.Nodes[n].(type) {
+					case *ast.Ident:
+						ident = node
+					case *ast.SelectorExpr:
+						ident = node.Sel
+					}
+					use, ok := lp.pkg.TypesInfo.Uses[ident]
+					if !ok {
+						return true
+					}
+					var lpIdent *libifyPkg
+					if n.Path == "" {
+						lpIdent = lp
+					} else {
+						lpi, ok := l.packages[n.Path]
+						if !ok {
+							return true
+						}
+						lpIdent = lpi
+					}
+					if !lpIdent.packageLevelVarObject[use] {
+						return true
+					}
+					lp.varUses[n] = true
+				}
+				return true
+			})
+		}
+	}
+	return nil
+}
+
+func (l *libifier) findFuncUses() error {
+	fmt.Fprintln(l.options.Out, "findFuncUses")
+	defer fmt.Fprintln(l.options.Out, "findFuncUses done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			if strings.HasSuffix(lp.pkg.Decorator.Filenames[file], "_test.go") {
+				continue
+			}
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.Ident:
+					var ident *ast.Ident
+					switch node := lp.pkg.Decorator.Ast.Nodes[n].(type) {
+					case *ast.Ident:
+						ident = node
+					case *ast.SelectorExpr:
+						ident = node.Sel
+					}
+					use, ok := lp.pkg.TypesInfo.Uses[ident]
+					if !ok {
+						return true
+					}
+					var lpIdent *libifyPkg
+					if n.Path == "" {
+						lpIdent = lp
+					} else {
+						lpi, ok := l.packages[n.Path]
+						if !ok {
+							return true
+						}
+						lpIdent = lpi
+					}
+					if !lpIdent.funcObject[use] {
+						return true
+					}
+					lp.funcUses[n] = true
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) findFuncs() error {
+	fmt.Fprintln(l.options.Out, "findFuncs")
+	defer fmt.Fprintln(l.options.Out, "findFuncs done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			if strings.HasSuffix(lp.pkg.Decorator.Filenames[file], "_test.go") {
+				continue
+			}
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.FuncDecl:
+					if n.Recv != nil {
+						return true
+					}
+					ob := lp.pkg.TypesInfo.Defs[lp.pkg.Decorator.Ast.Nodes[n.Name].(*ast.Ident)]
+					lp.funcObject[ob] = true
+					lp.funcFuncDecl[n] = true
+				}
+				return true
+			}, nil)
 		}
 	}
 	return nil
