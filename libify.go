@@ -41,6 +41,10 @@ func Main(ctx context.Context, options Options) error {
 		return errors.WithStack(err)
 	}
 
+	if err := l.findMethods(); err != nil {
+		return errors.WithStack(err)
+	}
+
 	if err := l.findFuncs(); err != nil {
 		return errors.WithStack(err)
 	}
@@ -49,10 +53,35 @@ func Main(ctx context.Context, options Options) error {
 		return errors.WithStack(err)
 	}
 
+	if err := l.findStructTypes(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := l.findAliasTypes(); err != nil {
+		return errors.WithStack(err)
+	}
+
 	// ===== NO READING AFTER HERE ======
 	// ===== NO WRITING BEFORE HERE =====
 
+	// must go first so we get package state import names populated
+	if err := l.addStateFiles(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := l.addStructFields(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := l.updateAliasTypes(); err != nil {
+		return errors.WithStack(err)
+	}
+
 	if err := l.updateFuncs(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := l.updateMethods(); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -64,11 +93,11 @@ func Main(ctx context.Context, options Options) error {
 		return errors.WithStack(err)
 	}
 
-	if err := l.addStateFiles(); err != nil {
+	if err := l.updateUses(); err != nil {
 		return errors.WithStack(err)
 	}
 
-	if err := l.updateUses(); err != nil {
+	if err := l.renameMain(); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -96,8 +125,15 @@ func newLibifyPkg(path string) *libifyPkg {
 		packageStateImportFieldNames: map[string]string{},
 		funcFuncDecl:                 map[*dst.FuncDecl]bool{},
 		funcObject:                   map[types.Object]bool{},
+		methodFuncDecl:               map[*dst.FuncDecl]bool{},
+		methodObject:                 map[types.Object]bool{},
 		varUses:                      map[*dst.Ident]bool{},
 		funcUses:                     map[*dst.Ident]bool{},
+		structStructType:             map[*dst.StructType]bool{},
+		structTypeSpec:               map[*dst.TypeSpec]bool{},
+		structObject:                 map[types.Object]bool{},
+		aliasTypeSpec:                map[*dst.TypeSpec]bool{},
+		aliasObject:                  map[types.Object]bool{},
 	}
 }
 
@@ -110,10 +146,17 @@ type libifyPkg struct {
 	packageLevelVarObject        map[types.Object]bool
 	funcFuncDecl                 map[*dst.FuncDecl]bool
 	funcObject                   map[types.Object]bool
+	methodFuncDecl               map[*dst.FuncDecl]bool
+	methodObject                 map[types.Object]bool
 	packageLevelVarValueSpec     map[*dst.ValueSpec]bool
 	packageStateImportFieldNames map[string]string // path -> field name
 	varUses                      map[*dst.Ident]bool
 	funcUses                     map[*dst.Ident]bool
+	structStructType             map[*dst.StructType]bool
+	structTypeSpec               map[*dst.TypeSpec]bool
+	structObject                 map[types.Object]bool
+	aliasTypeSpec                map[*dst.TypeSpec]bool
+	aliasObject                  map[types.Object]bool
 }
 
 func (l *libifier) addStateFiles() error {
@@ -138,7 +181,7 @@ func (l *libifier) addStateFiles() error {
 		fields = append(fields, importFields...)
 
 		if len(importFields) > 0 {
-			importFields[0].Decs.Before = dst.EmptyLine
+			importFields[0].Decs.Before = dst.NewLine
 			importFields[0].Decs.Start.Prepend("// Package imports")
 		}
 
@@ -152,7 +195,7 @@ func (l *libifier) addStateFiles() error {
 		fields = append(fields, varFields...)
 
 		if len(varFields) > 0 {
-			varFields[0].Decs.Before = dst.EmptyLine
+			varFields[0].Decs.Before = dst.NewLine
 			varFields[0].Decs.Start.Prepend("// Package level vars")
 		}
 
@@ -258,6 +301,7 @@ func (l *libifier) generateNewPackageStateFuncBody(lp *libifyPkg) ([]dst.Stmt, e
 				},
 			},
 		},
+		Decs: dst.AssignStmtDecorations{NodeDecs: dst.NodeDecs{Before: dst.NewLine}},
 	})
 
 	imports := l.sortAndFilterImports(lp)
@@ -277,6 +321,7 @@ func (l *libifier) generateNewPackageStateFuncBody(lp *libifyPkg) ([]dst.Stmt, e
 			Rhs: []dst.Expr{
 				dst.NewIdent(fmt.Sprintf("%sPackageState", name)),
 			},
+			Decs: dst.AssignStmtDecorations{NodeDecs: dst.NodeDecs{Before: dst.NewLine}},
 		})
 	}
 
@@ -296,9 +341,9 @@ func (l *libifier) generateNewPackageStateFuncBody(lp *libifyPkg) ([]dst.Stmt, e
 						Sel: dst.NewIdent(v.Name()),
 					},
 				},
-				Tok: token.ASSIGN,
-				//Rhs: []dst.Expr{dst.Clone(lp.pkg.Decorator.Dst.Nodes[i.Rhs]).(dst.Expr)},
-				Rhs: []dst.Expr{lp.pkg.Decorator.Dst.Nodes[i.Rhs].(dst.Expr)},
+				Tok:  token.ASSIGN,
+				Rhs:  []dst.Expr{lp.pkg.Decorator.Dst.Nodes[i.Rhs].(dst.Expr)},
+				Decs: dst.AssignStmtDecorations{NodeDecs: dst.NodeDecs{Before: dst.NewLine}},
 			})
 		}
 	}
@@ -308,6 +353,7 @@ func (l *libifier) generateNewPackageStateFuncBody(lp *libifyPkg) ([]dst.Stmt, e
 		Results: []dst.Expr{
 			dst.NewIdent("pstate"),
 		},
+		Decs: dst.ReturnStmtDecorations{NodeDecs: dst.NodeDecs{Before: dst.NewLine}},
 	})
 
 	return body, nil
@@ -389,27 +435,20 @@ func (l *libifier) updateFuncUses() error {
 			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
 				switch n := c.Node().(type) {
 				case *dst.CallExpr:
-					var id *dst.Ident
-					switch fun := n.Fun.(type) {
-					case *dst.Ident:
-						id = fun
-					//case *dst.SelectorExpr:
-					//	id = fun.Sel
-					default:
+
+					id, ok := n.Fun.(*dst.Ident)
+					if !ok {
 						return true
 					}
+					if !lp.funcUses[id] {
+						return true
+					}
+
 					if id.Path == "" {
-						if !lp.funcUses[id] {
-							return true
-						}
 						param := dst.NewIdent("pstate")
 						n.Args = append([]dst.Expr{param}, n.Args...)
 					} else {
-						lpid, ok := l.packages[id.Path]
-						if !ok {
-							return true
-						}
-						if !lpid.funcUses[id] {
+						if _, ok := l.packages[id.Path]; !ok {
 							return true
 						}
 						param := &dst.SelectorExpr{
@@ -419,6 +458,138 @@ func (l *libifier) updateFuncUses() error {
 						n.Args = append([]dst.Expr{param}, n.Args...)
 					}
 
+					/*
+						var id *dst.Ident
+						switch fun := n.Fun.(type) {
+						case *dst.Ident:
+							id = fun
+						//case *dst.SelectorExpr:
+						//	id = fun.Sel
+						default:
+							return true
+						}
+						if id.Path == "" {
+							if !lp.funcUses[id] {
+								return true
+							}
+							param := dst.NewIdent("pstate")
+							n.Args = append([]dst.Expr{param}, n.Args...)
+						} else {
+							lpid, ok := l.packages[id.Path]
+							if !ok {
+								return true
+							}
+							if !lpid.funcUses[id] {
+								return true
+							}
+							param := &dst.SelectorExpr{
+								X:   dst.NewIdent("pstate"),
+								Sel: dst.NewIdent(lp.packageStateImportFieldNames[id.Path]),
+							}
+							n.Args = append([]dst.Expr{param}, n.Args...)
+						}
+					*/
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) updateAliasTypes() error {
+	fmt.Fprintln(l.options.Out, "updateAliasTypes")
+	defer fmt.Fprintln(l.options.Out, "updateAliasTypes done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.TypeSpec:
+					if !lp.aliasTypeSpec[n] {
+						return true
+					}
+					t := &dst.StructType{
+						Fields: &dst.FieldList{
+							Opening: true,
+							List: []*dst.Field{
+								{
+									Names: []*dst.Ident{dst.NewIdent("pstate")},
+									Type:  &dst.StarExpr{X: dst.NewIdent("PackageState")},
+								},
+								{
+									Names: []*dst.Ident{dst.NewIdent("Value")},
+									Type:  n.Type,
+								},
+							},
+							Closing: true,
+						},
+					}
+					n.Type = t
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) addStructFields() error {
+	fmt.Fprintln(l.options.Out, "addStructFields")
+	defer fmt.Fprintln(l.options.Out, "addStructFields done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.StructType:
+					if !lp.structStructType[n] {
+						return true
+					}
+					f := &dst.Field{
+						Names: []*dst.Ident{dst.NewIdent("pstate")},
+						Type:  &dst.StarExpr{X: dst.NewIdent("PackageState")},
+					}
+					n.Fields.List = append([]*dst.Field{f}, n.Fields.List...)
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) updateMethods() error {
+	fmt.Fprintln(l.options.Out, "updateMethods")
+	defer fmt.Fprintln(l.options.Out, "updateMethods done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.FuncDecl:
+					if !lp.methodFuncDecl[n] {
+						return true
+					}
+					// if the receiver has no name, give it one
+					if len(n.Recv.List[0].Names) == 0 {
+						n.Recv.List[0].Names = []*dst.Ident{dst.NewIdent("foo")}
+					}
+					stmts := []dst.Stmt{
+						&dst.AssignStmt{
+							Lhs: []dst.Expr{dst.NewIdent("pstate")},
+							Tok: token.DEFINE,
+							Rhs: []dst.Expr{
+								&dst.SelectorExpr{
+									X:   dst.NewIdent(n.Recv.List[0].Names[0].Name),
+									Sel: dst.NewIdent("pstate"),
+								},
+							},
+						},
+						&dst.AssignStmt{
+							Lhs: []dst.Expr{dst.NewIdent("_")},
+							Tok: token.ASSIGN,
+							Rhs: []dst.Expr{dst.NewIdent("pstate")},
+						},
+					}
+					n.Body.List = append(stmts, n.Body.List...)
 				}
 				return true
 			}, nil)
@@ -477,6 +648,33 @@ func (l *libifier) save() error {
 		if err := lp.pkg.SaveWithResolver(guess.New()); err != nil {
 			return errors.WithStack(err)
 		}
+	}
+	return nil
+}
+
+func (l *libifier) renameMain() error {
+	fmt.Fprintln(l.options.Out, "renameMain")
+	defer fmt.Fprintln(l.options.Out, "renameMain done")
+	lp := l.packages[l.options.Path]
+	for _, file := range lp.pkg.Syntax {
+		var done bool
+		dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+			if done {
+				return false
+			}
+			switch n := c.Node().(type) {
+			case *dst.FuncDecl:
+				if n.Recv != nil {
+					return true
+				}
+				if n.Name.Name == "main" {
+					n.Name.Name = "Main"
+					done = true
+					return false
+				}
+			}
+			return true
+		}, nil)
 	}
 	return nil
 }
@@ -562,9 +760,6 @@ func (l *libifier) findFuncUses() error {
 	defer fmt.Fprintln(l.options.Out, "findFuncUses done")
 	for _, lp := range l.packages {
 		for _, file := range lp.pkg.Syntax {
-			if strings.HasSuffix(lp.pkg.Decorator.Filenames[file], "_test.go") {
-				continue
-			}
 			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
 				switch n := c.Node().(type) {
 				case *dst.Ident:
@@ -601,14 +796,91 @@ func (l *libifier) findFuncUses() error {
 	return nil
 }
 
+func (l *libifier) findAliasTypes() error {
+	fmt.Fprintln(l.options.Out, "findAliasTypes")
+	defer fmt.Fprintln(l.options.Out, "findAliasTypes done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.GenDecl:
+					if n.Tok != token.TYPE {
+						return true
+					}
+					for _, spec := range n.Specs {
+						spec := spec.(*dst.TypeSpec)
+						if _, ok := spec.Type.(*dst.StructType); ok {
+							continue
+						}
+						ob := lp.pkg.TypesInfo.Defs[lp.pkg.Decorator.Ast.Nodes[spec.Name].(*ast.Ident)]
+						lp.aliasTypeSpec[spec] = true
+						lp.aliasObject[ob] = true
+					}
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) findStructTypes() error {
+	fmt.Fprintln(l.options.Out, "findStructTypes")
+	defer fmt.Fprintln(l.options.Out, "findStructTypes done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.GenDecl:
+					if n.Tok != token.TYPE {
+						return true
+					}
+					for _, spec := range n.Specs {
+						spec := spec.(*dst.TypeSpec)
+						st, ok := spec.Type.(*dst.StructType)
+						if !ok {
+							continue
+						}
+						ob := lp.pkg.TypesInfo.Defs[lp.pkg.Decorator.Ast.Nodes[spec.Name].(*ast.Ident)]
+						lp.structStructType[st] = true
+						lp.structTypeSpec[spec] = true
+						lp.structObject[ob] = true
+					}
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
+func (l *libifier) findMethods() error {
+	fmt.Fprintln(l.options.Out, "findMethods")
+	defer fmt.Fprintln(l.options.Out, "findMethods done")
+	for _, lp := range l.packages {
+		for _, file := range lp.pkg.Syntax {
+			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
+				switch n := c.Node().(type) {
+				case *dst.FuncDecl:
+					if n.Recv == nil {
+						return true
+					}
+					ob := lp.pkg.TypesInfo.Defs[lp.pkg.Decorator.Ast.Nodes[n.Name].(*ast.Ident)]
+					lp.methodObject[ob] = true
+					lp.methodFuncDecl[n] = true
+				}
+				return true
+			}, nil)
+		}
+	}
+	return nil
+}
+
 func (l *libifier) findFuncs() error {
 	fmt.Fprintln(l.options.Out, "findFuncs")
 	defer fmt.Fprintln(l.options.Out, "findFuncs done")
 	for _, lp := range l.packages {
 		for _, file := range lp.pkg.Syntax {
-			if strings.HasSuffix(lp.pkg.Decorator.Filenames[file], "_test.go") {
-				continue
-			}
 			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
 				switch n := c.Node().(type) {
 				case *dst.FuncDecl:
@@ -631,9 +903,6 @@ func (l *libifier) findPackageLevelVars() error {
 	defer fmt.Fprintln(l.options.Out, "findPackageLevelVars done")
 	for _, lp := range l.packages {
 		for _, file := range lp.pkg.Syntax {
-			if strings.HasSuffix(lp.pkg.Decorator.Filenames[file], "_test.go") {
-				continue
-			}
 			dstutil.Apply(file, func(c *dstutil.Cursor) bool {
 				switch n := c.Node().(type) {
 				case *dst.GenDecl:
@@ -680,7 +949,7 @@ func (l *libifier) load(ctx context.Context) error {
 
 	start := time.Now()
 	var err error
-	l.paths, err = LoadAllPackages(ctx, l.options.Path, l.options.RootDir, filter)
+	l.paths, err = LoadAllPackages(ctx, l.options.Path, l.options.RootDir, l.options.Tests, filter)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -689,7 +958,7 @@ func (l *libifier) load(ctx context.Context) error {
 
 	config := &packages.Config{
 		Mode:    packages.LoadSyntax,
-		Tests:   true,
+		Tests:   l.options.Tests,
 		Context: ctx,
 		Dir:     l.options.RootDir,
 	}
@@ -752,6 +1021,7 @@ type Options struct {
 	RootPath string
 	RootDir  string
 	Out      io.Writer
+	Tests    bool
 }
 
 func stripVendor(path string) string {

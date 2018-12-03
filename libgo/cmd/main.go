@@ -26,7 +26,8 @@ func compileOptions() libgo.Options {
 			"cmd/compile_test":             {"TestFormats": true},
 			"cmd/compile/internal/gc_test": {"TestBuiltin": true},
 		},
-		Init: false,
+		Init:  false,
+		Tests: false, // TODO: adding test packages break things.
 	}
 }
 
@@ -41,6 +42,7 @@ func linkOptions() libgo.Options {
 				"TestDWARFiOS": true,
 			},
 		},
-		Init: false,
+		Init:  false,
+		Tests: false, // TODO: adding test packages break things.
 	}
 }

@@ -8,10 +8,10 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-func LoadAllPackages(ctx context.Context, path, dir string, filter func(string) bool) ([]string, error) {
+func LoadAllPackages(ctx context.Context, path, dir string, tests bool, filter func(string) bool) ([]string, error) {
 	cfg := &packages.Config{
 		Mode:    packages.LoadImports,
-		Tests:   true,
+		Tests:   tests,
 		Context: ctx,
 		Dir:     dir,
 	}
@@ -31,6 +31,7 @@ func LoadAllPackages(ctx context.Context, path, dir string, filter func(string) 
 		// here we have:
 		//
 		// | PkgPath | ID              |
+		// | X       | X               | just non-test files
 		// | X       | X [X.test]      | all files in X package (including tests)
 		// | X_test  | X_test [X.test] | just test files in X_test package (this is missing if no X_test tests)
 		//
@@ -67,15 +68,19 @@ func LoadAllPackages(ctx context.Context, path, dir string, filter func(string) 
 		process(pkg)
 	}
 
-	// packages.Load with Test:true only returns test packages in the specified package (not
-	// imports), so a second run is needed to pick up the imports of all _test packages.
-	pkgs, err = packages.Load(cfg, out...)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
+	if tests {
 
-	for _, pkg := range pkgs {
-		process(pkg)
+		// packages.Load with Test:true only returns test packages in the specified package (not
+		// imports), so a second run is needed to pick up the imports of all _test packages.
+		pkgs, err = packages.Load(cfg, out...)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		for _, pkg := range pkgs {
+			process(pkg)
+		}
+
 	}
 
 	return out, nil

@@ -230,7 +230,7 @@ func (l *libgoer) load(ctx context.Context) error {
 	pth := l.options.From
 
 	start := time.Now()
-	paths, err := libify.LoadAllPackages(ctx, pth, dir, filter)
+	paths, err := libify.LoadAllPackages(ctx, pth, dir, l.options.Tests, filter)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -239,7 +239,7 @@ func (l *libgoer) load(ctx context.Context) error {
 
 	cfg := &packages.Config{
 		Mode:    packages.LoadSyntax,
-		Tests:   true,
+		Tests:   l.options.Tests,
 		Context: ctx,
 		Dir:     dir,
 	}
@@ -329,4 +329,5 @@ type Options struct {
 	RootDir      string // dir of module root
 	DisableTests map[string]map[string]bool
 	Init         bool
+	Tests        bool
 }
