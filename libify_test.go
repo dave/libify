@@ -10,8 +10,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-
-	"github.com/dave/dst/decorator/dummy"
 )
 
 func TestFoo(t *testing.T) {
@@ -205,12 +203,12 @@ func TestFoo(t *testing.T) {
 				continue
 			}
 			t.Run(test.name+"/"+c.name, func(t *testing.T) {
-				dir, err := dummy.TempDir(test.setup)
+				dir, err := TempDir(test.setup)
 				defer os.RemoveAll(dir)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := dummy.AddToDir(dir, c.src); err != nil {
+				if err := AddToDir(dir, c.src); err != nil {
 					t.Fatal(err)
 				}
 				options := Options{
@@ -290,7 +288,7 @@ func compareDir(t *testing.T, dir string, expect map[string]string) {
 }
 
 func TestMain_load(t *testing.T) {
-	dir, err := dummy.TempDir(map[string]string{
+	dir, err := TempDir(map[string]string{
 		"main/main.go": "package main \n\n import \"root/a\" \n\n func main(){a.A()}",
 		"a/a.go":       "package a \n\n func A(){}",
 		"go.mod":       "module root",
@@ -315,7 +313,7 @@ func TestMain_load(t *testing.T) {
 }
 
 func TestMain_findPackageLevelVars(t *testing.T) {
-	dir, err := dummy.TempDir(map[string]string{
+	dir, err := TempDir(map[string]string{
 		"main/main.go": "package main \n\n import \"root/a\" \n\n var N, M int \n\n func main(){a.A()}",
 		"a/a.go":       "package a \n\n var A string \n\n func A(){}",
 		"go.mod":       "module root",
